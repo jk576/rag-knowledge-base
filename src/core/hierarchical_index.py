@@ -43,7 +43,7 @@ class SummaryGenerator:
     使用 LLM 生成文档摘要，用于层次化检索。
     """
     
-    def __init__(self, model: str = "qwen2.5:7b"):
+    def __init__(self, model: str = "qwen3:8b"):
         self.model = model
         self._ollama_host = settings.OLLAMA_HOST
     

@@ -42,6 +42,7 @@ def _search(
     search_mode: str,
     top_k: int,
     score_threshold: float,
+    full_content: bool = False,
 ):
     """执行搜索"""
     payload = {
@@ -83,7 +84,7 @@ def _search(
         if isinstance(r, dict):
             score = r.get("score", 0)
             content = r.get("content", "")
-            doc_name = r.get("document_name", r.get("metadata", {}).get("name", "-"))
+            doc_name = r.get("document_name", r.get("metadata", {}).get("filename", "-"))
             search_type = r.get("search_type", search_mode)
         else:
             score = 0
@@ -102,49 +103,15 @@ def _search(
         console.print(f"[bold cyan]{i}.[/bold cyan] [dim]({search_type}, 分数: [{score_color}]{score:.3f}[/{score_color}])[/dim]")
         console.print(f"   [magenta]{doc_name}[/magenta]")
         
-        # 格式化内容
-        display_content = truncate_text(content, 300)
+        # 格式化内容（根据 full_content 决定是否截断）
+        if full_content:
+            display_content = content
+        else:
+            display_content = truncate_text(content, 300)
         console.print(f"   {display_content}\n")
         
         # 添加分隔线
         console.print("[dim]" + "─" * 60 + "[/dim]\n")
-
-
-# 使用 callback 作为默认命令
-@app.callback(invoke_without_command=True)
-def search_main(
-    ctx: typer.Context,
-    project: str = typer.Argument(None, help="项目名称或ID"),
-    query: str = typer.Argument(None, help="查询内容"),
-    mode: str = typer.Option("semantic", "--mode", "-m", help="搜索模式 (semantic/keyword/hybrid)"),
-    top_k: int = typer.Option(10, "--top-k", "-k", help="返回数量"),
-    score_threshold: float = typer.Option(0.0, "--threshold", "-t", help="分数阈值 (0-1)"),
-):
-    """搜索知识库 (支持项目名称或ID)
-
-    用法:
-        ragctl search <项目名> <查询内容>
-        ragctl search yunxi "需求文档"
-        ragctl search openclaw "API设计" -m hybrid -k 20
-    """
-    # 如果有子命令，执行子命令
-    if ctx.invoked_subcommand is not None:
-        return
-    
-    # 否则需要 project 和 query 参数
-    if not project or not query:
-        console.print("[red]错误: 需要提供项目名称和查询内容[/red]")
-        console.print("[dim]用法: ragctl search <项目名> <查询内容>[/dim]")
-        console.print("[dim]示例: ragctl search yunxi \"需求文档\"[/dim]")
-        raise typer.Exit(1)
-    
-    # 解析项目 ID
-    project_id = _resolve_project_id(project)
-    
-    if project_id != project:
-        console.print(f"[dim]项目: {project} → {project_id[:8]}...[/dim]")
-    
-    _search(project_id, query, mode, top_k, score_threshold)
 
 
 @app.command()
@@ -153,12 +120,17 @@ def semantic(
     query: str = typer.Argument(..., help="查询内容"),
     top_k: int = typer.Option(10, "--top-k", "-k", help="返回数量"),
     score_threshold: float = typer.Option(0.0, "--threshold", "-t", help="分数阈值 (0-1)"),
+    full: bool = typer.Option(False, "--full", "-f", help="显示完整内容"),
 ):
-    """语义搜索"""
+    """语义搜索 - 基于向量相似度
+    
+    用法: ragctl search semantic <项目> <查询>
+    示例: ragctl search semantic yunxi "采矿计划编制"
+    """
     project_id = _resolve_project_id(project)
     if project_id != project:
         console.print(f"[dim]项目: {project} → {project_id[:8]}...[/dim]")
-    _search(project_id, query, "semantic", top_k, score_threshold)
+    _search(project_id, query, "semantic", top_k, score_threshold, full)
 
 
 @app.command()
@@ -167,12 +139,17 @@ def keyword(
     query: str = typer.Argument(..., help="查询内容"),
     top_k: int = typer.Option(10, "--top-k", "-k", help="返回数量"),
     score_threshold: float = typer.Option(0.0, "--threshold", "-t", help="分数阈值 (0-1)"),
+    full: bool = typer.Option(False, "--full", "-f", help="显示完整内容"),
 ):
-    """关键词搜索"""
+    """关键词搜索 - 基于 BM25
+    
+    用法: ragctl search keyword <项目> <查询>
+    示例: ragctl search keyword yunxi "业务场景"
+    """
     project_id = _resolve_project_id(project)
     if project_id != project:
         console.print(f"[dim]项目: {project} → {project_id[:8]}...[/dim]")
-    _search(project_id, query, "keyword", top_k, score_threshold)
+    _search(project_id, query, "keyword", top_k, score_threshold, full)
 
 
 @app.command()
@@ -181,9 +158,36 @@ def hybrid(
     query: str = typer.Argument(..., help="查询内容"),
     top_k: int = typer.Option(10, "--top-k", "-k", help="返回数量"),
     score_threshold: float = typer.Option(0.0, "--threshold", "-t", help="分数阈值 (0-1)"),
+    full: bool = typer.Option(False, "--full", "-f", help="显示完整内容"),
 ):
-    """混合搜索 (语义+关键词)"""
+    """混合搜索 - 向量 + BM25 + RRF 融合（推荐）
+    
+    用法: ragctl search hybrid <项目> <查询>
+    示例: ragctl search hybrid yunxi "数据中台架构" -k 5
+          ragctl search hybrid yunxi "数据中台架构" -k 1 --full
+    """
     project_id = _resolve_project_id(project)
     if project_id != project:
         console.print(f"[dim]项目: {project} → {project_id[:8]}...[/dim]")
-    _search(project_id, query, "hybrid", top_k, score_threshold)
+    _search(project_id, query, "hybrid", top_k, score_threshold, full)
+
+
+@app.command()
+def hierarchical(
+    project: str = typer.Argument(..., help="项目名称或ID"),
+    query: str = typer.Argument(..., help="查询内容"),
+    top_k: int = typer.Option(10, "--top-k", "-k", help="返回数量"),
+    score_threshold: float = typer.Option(0.0, "--threshold", "-t", help="分数阈值 (0-1)"),
+    full: bool = typer.Option(False, "--full", "-f", help="显示完整内容"),
+):
+    """层次化搜索 - RAPTOR（文档摘要 + chunks）
+    
+    用法: ragctl search hierarchical <项目> <查询>
+    示例: ragctl search hierarchical yunxi "项目总体设计"
+    
+    特点: 先搜索文档摘要，再搜索相关 chunks，适合长文档
+    """
+    project_id = _resolve_project_id(project)
+    if project_id != project:
+        console.print(f"[dim]项目: {project} → {project_id[:8]}...[/dim]")
+    _search(project_id, query, "hierarchical", top_k, score_threshold, full)

@@ -37,7 +37,7 @@ class Project(Base):
     description = Column(Text, nullable=True)
     document_count = Column(Integer, default=0)
     chunk_count = Column(Integer, default=0)
-    watcher_enabled = Column(Integer, default=1)  # 0=关闭同步, 1=启用同步（默认启用）
+    watcher_enabled = Column(Integer, default=0)  # 0=关闭同步（默认）, 1=启用同步
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

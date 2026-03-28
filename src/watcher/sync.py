@@ -64,6 +64,7 @@ class ProjectMapping:
             description=f"Auto-synced from {folder_path}",
             document_count=0,
             chunk_count=0,
+            watcher_enabled=0,  # 自动创建的项目默认关闭同步
         )
         self.db.add(project)
         self.db.commit()

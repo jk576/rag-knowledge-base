@@ -45,10 +45,11 @@ class ProjectService:
         if existing:
             raise ValueError(f"项目名称 '{project.name}' 已存在")
         
-        # 创建项目
+        # 创建项目（默认关闭 watcher）
         db_project = ProjectModel(
             name=project.name,
             description=project.description,
+            watcher_enabled=0,  # 新建项目默认关闭同步
         )
         self.db.add(db_project)
         self.db.commit()
