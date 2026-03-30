@@ -432,6 +432,9 @@ class DocumentProcessor:
             
         Returns:
             提取的注释内容（格式化为 Markdown）
+            
+        Raises:
+            ValueError: 文件无注释或提取失败时抛出（不入 RAG 索引）
         """
         # 优先使用 CommentExtractor
         if self.comment_extractor:
@@ -441,19 +444,15 @@ class DocumentProcessor:
                     logger.debug(f"提取代码注释: {file_path.name} - {len(comments)} 字符")
                     return comments
                 else:
-                    # 没有注释，返回文件元信息
-                    return f"# File: {file_path.name}\n\n[此文件无注释内容]"
+                    # 没有注释，跳过索引（抛出异常让调用方处理）
+                    raise ValueError(f"代码文件无注释内容，跳过索引: {file_path.name}")
             except ValueError as e:
+                # 如果是"无注释"的情况，重新抛出让调用方跳过
+                if "无注释" in str(e):
+                    raise
+                # 其他错误也跳过索引
                 logger.warning(f"注释提取失败: {e}")
-                # 回退到简单的文件信息
-                return f"# File: {file_path.name}\n\n[注释提取失败]"
+                raise ValueError(f"注释提取失败，跳过索引: {file_path.name}")
         
-        # 回退：返回文件基本信息（不包含代码）
-        try:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                # 只读取前几行作为文件描述
-                lines = f.readlines()[:10]
-                preview = "\n".join(lines)
-            return f"# File: {file_path.name}\n\n[代码文件 - 前10行预览]\n\n{preview}"
-        except Exception as e:
-            raise ValueError(f"代码文件读取失败: {e}")
+        # CommentExtractor 不可用，跳过代码文件
+        raise ValueError(f"CommentExtractor 不可用，跳过代码文件: {file_path.name}")

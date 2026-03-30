@@ -13,7 +13,6 @@ from src.core.comment_extractor import (
     CODE_EXTENSIONS,
     IMAGE_EXTENSIONS,
     SUPPORTED_EXTENSIONS,
-    get_file_category,
 )
 
 try:

@@ -41,6 +41,10 @@ IMAGE_EXTENSIONS: Set[str] = {
 
 SUPPORTED_EXTENSIONS = DOC_EXTENSIONS | CODE_EXTENSIONS | IMAGE_EXTENSIONS
 
+# 文件大小限制（避免处理超大文件）
+MAX_FILE_SIZE_MB = 10  # 代码文件最大 10MB
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+
 
 def get_file_category(file_path: Union[str, Path]) -> str:
     """获取文件类别
@@ -141,12 +145,25 @@ class CommentExtractor:
         Returns:
             提取的注释内容，格式化为 Markdown
             如果没有注释则返回空字符串
+            
+        Raises:
+            ValueError: 文件类型不支持、文件过大或读取失败
         """
         file_path = Path(file_path)
         language = self.get_language(file_path)
         
         if not language:
             raise ValueError(f"不支持的文件类型: {file_path.suffix}")
+        
+        # 检查文件大小
+        try:
+            file_size = file_path.stat().st_size
+            if file_size > MAX_FILE_SIZE_BYTES:
+                raise ValueError(
+                    f"文件过大 ({file_size / 1024 / 1024:.1f}MB > {MAX_FILE_SIZE_MB}MB)，跳过处理"
+                )
+        except FileNotFoundError:
+            raise ValueError(f"文件不存在: {file_path}")
         
         try:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
