@@ -7,6 +7,15 @@ import logging
 from pathlib import Path
 from typing import List, Optional, Union
 
+# 从统一配置导入文件类型定义
+from src.core.comment_extractor import (
+    DOC_EXTENSIONS,
+    CODE_EXTENSIONS,
+    IMAGE_EXTENSIONS,
+    SUPPORTED_EXTENSIONS,
+    get_file_category,
+)
+
 try:
     import pathspec
     PATHSPEC_AVAILABLE = True
@@ -247,31 +256,6 @@ class GitIgnoreParser:
         
         return False
     
-    # 文件类型配置：哪些类型入 RAG 索引，哪些类型只提取注释
-    
-    # 文档类型 - 全文索引
-    DOC_EXTENSIONS = {
-        ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt",
-        ".md", ".txt", ".rst",
-    }
-    
-    # 代码类型 - 只提取注释（不入代码本身）
-    CODE_EXTENSIONS = {
-        ".py", ".js", ".jsx", ".ts", ".tsx",
-        ".java", ".go", ".rs",
-        ".cpp", ".c", ".h", ".hpp", ".cc",
-        ".sh", ".bash", ".zsh",
-        ".rb", ".php",
-    }
-    
-    # 图片类型 - OCR 提取
-    IMAGE_EXTENSIONS = {
-        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp",
-    }
-    
-    # 所有支持的文件类型
-    SUPPORTED_EXTENSIONS = DOC_EXTENSIONS | CODE_EXTENSIONS | IMAGE_EXTENSIONS
-    
     def should_process(self, file_path: Union[str, Path]) -> bool:
         """
         检查文件是否应该被处理（不被忽略且是支持的格式）
@@ -292,34 +276,13 @@ class GitIgnoreParser:
         if file_path.is_dir():
             return False
         
-        # 检查是否是支持的格式
+        # 检查是否是支持的格式（使用统一配置）
         ext = file_path.suffix.lower()
-        if ext not in self.SUPPORTED_EXTENSIONS:
+        if ext not in SUPPORTED_EXTENSIONS:
             logger.debug(f"File {file_path} has unsupported extension: {ext}")
             return False
         
         return True
-    
-    def get_file_category(self, file_path: Union[str, Path]) -> str:
-        """
-        获取文件类别
-        
-        Args:
-            file_path: 文件路径
-            
-        Returns:
-            文件类别: 'doc' | 'code' | 'image' | 'unknown'
-        """
-        ext = Path(file_path).suffix.lower()
-        
-        if ext in self.DOC_EXTENSIONS:
-            return 'doc'
-        elif ext in self.CODE_EXTENSIONS:
-            return 'code'
-        elif ext in self.IMAGE_EXTENSIONS:
-            return 'image'
-        else:
-            return 'unknown'
 
 
 class GitIgnoreCache:

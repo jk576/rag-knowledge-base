@@ -24,6 +24,13 @@ from src.core.document_processor import DocumentProcessor
 from src.core.embedding import EmbeddingService
 from src.core.vector_store import VectorStore
 from src.services.document_service import DocumentService
+# 从统一配置导入文件类型定义
+from src.core.comment_extractor import (
+    DOC_EXTENSIONS,
+    CODE_EXTENSIONS,
+    IMAGE_EXTENSIONS,
+    SUPPORTED_EXTENSIONS,
+)
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -411,29 +418,6 @@ class FileSync:
     实际的处理逻辑委托给 DocumentService。
     """
     
-    # 文档类型 - 全文索引
-    DOC_EXTENSIONS = {
-        ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt",
-        ".md", ".txt", ".rst",
-    }
-    
-    # 代码类型 - 只提取注释（不入代码本身）
-    CODE_EXTENSIONS = {
-        ".py", ".js", ".jsx", ".ts", ".tsx",
-        ".java", ".go", ".rs",
-        ".cpp", ".c", ".h", ".hpp", ".cc",
-        ".sh", ".bash", ".zsh",
-        ".rb", ".php",
-    }
-    
-    # 图片类型 - OCR 提取
-    IMAGE_EXTENSIONS = {
-        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp",
-    }
-    
-    # 所有支持的文件类型
-    SUPPORTED_EXTENSIONS = DOC_EXTENSIONS | CODE_EXTENSIONS | IMAGE_EXTENSIONS
-    
     def __init__(self, db: Session, project_id: str):
         self.db = db
         self.project_id = project_id
@@ -441,9 +425,9 @@ class FileSync:
         self.vector_store = VectorStore()
     
     def is_supported_file(self, file_path: Path) -> bool:
-        """检查文件是否是支持的格式"""
+        """检查文件是否是支持的格式（使用统一配置）"""
         ext = file_path.suffix.lower()
-        return ext in self.SUPPORTED_EXTENSIONS
+        return ext in SUPPORTED_EXTENSIONS
     
     def get_doc_type(self, file_path: Path) -> str:
         """获取文档类型
@@ -456,8 +440,8 @@ class FileSync:
         """
         ext = file_path.suffix.lower()
         
-        # 文档类型
-        if ext in self.DOC_EXTENSIONS:
+        # 文档类型（使用统一配置）
+        if ext in DOC_EXTENSIONS:
             doc_type_map = {
                 ".pdf": "pdf",
                 ".docx": "docx", ".doc": "docx",
@@ -467,12 +451,12 @@ class FileSync:
             }
             return doc_type_map.get(ext, "txt")
         
-        # 图片类型
-        if ext in self.IMAGE_EXTENSIONS:
+        # 图片类型（使用统一配置）
+        if ext in IMAGE_EXTENSIONS:
             return "image"
         
-        # 代码类型（统一返回 'code'）
-        if ext in self.CODE_EXTENSIONS:
+        # 代码类型（使用统一配置，统一返回 'code'）
+        if ext in CODE_EXTENSIONS:
             return "code"
         
         return "other"
