@@ -411,13 +411,28 @@ class FileSync:
     实际的处理逻辑委托给 DocumentService。
     """
     
-    # 支持的文件扩展名
-    SUPPORTED_EXTENSIONS = {
+    # 文档类型 - 全文索引
+    DOC_EXTENSIONS = {
         ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt",
-        ".md", ".txt",
-        ".py", ".js", ".ts", ".java", ".go", ".rs", ".cpp", ".c", ".h",
+        ".md", ".txt", ".rst",
+    }
+    
+    # 代码类型 - 只提取注释（不入代码本身）
+    CODE_EXTENSIONS = {
+        ".py", ".js", ".jsx", ".ts", ".tsx",
+        ".java", ".go", ".rs",
+        ".cpp", ".c", ".h", ".hpp", ".cc",
+        ".sh", ".bash", ".zsh",
+        ".rb", ".php",
+    }
+    
+    # 图片类型 - OCR 提取
+    IMAGE_EXTENSIONS = {
         ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp",
     }
+    
+    # 所有支持的文件类型
+    SUPPORTED_EXTENSIONS = DOC_EXTENSIONS | CODE_EXTENSIONS | IMAGE_EXTENSIONS
     
     def __init__(self, db: Session, project_id: str):
         self.db = db
@@ -431,36 +446,36 @@ class FileSync:
         return ext in self.SUPPORTED_EXTENSIONS
     
     def get_doc_type(self, file_path: Path) -> str:
-        """获取文档类型"""
+        """获取文档类型
+        
+        Args:
+            file_path: 文件路径
+            
+        Returns:
+            文档类型: 'pdf' | 'docx' | 'xlsx' | 'pptx' | 'image' | 'md' | 'txt' | 'code'
+        """
         ext = file_path.suffix.lower()
-        type_map = {
-            ".pdf": "pdf",
-            ".docx": "docx",
-            ".doc": "docx",
-            ".xlsx": "xlsx",
-            ".xls": "xlsx",
-            ".pptx": "pptx",
-            ".ppt": "pptx",
-            ".png": "image",
-            ".jpg": "image",
-            ".jpeg": "image",
-            ".gif": "image",
-            ".bmp": "image",
-            ".tiff": "image",
-            ".webp": "image",
-            ".md": "md",
-            ".txt": "txt",
-            ".py": "code",
-            ".js": "code",
-            ".ts": "code",
-            ".java": "code",
-            ".go": "code",
-            ".rs": "code",
-            ".cpp": "code",
-            ".c": "code",
-            ".h": "code",
-        }
-        return type_map.get(ext, "other")
+        
+        # 文档类型
+        if ext in self.DOC_EXTENSIONS:
+            doc_type_map = {
+                ".pdf": "pdf",
+                ".docx": "docx", ".doc": "docx",
+                ".xlsx": "xlsx", ".xls": "xlsx",
+                ".pptx": "pptx", ".ppt": "pptx",
+                ".md": "md", ".txt": "txt", ".rst": "txt",
+            }
+            return doc_type_map.get(ext, "txt")
+        
+        # 图片类型
+        if ext in self.IMAGE_EXTENSIONS:
+            return "image"
+        
+        # 代码类型（统一返回 'code'）
+        if ext in self.CODE_EXTENSIONS:
+            return "code"
+        
+        return "other"
     
     def get_document_by_filename(self, filename: str) -> Optional[DocumentModel]:
         """根据文件名获取文档"""

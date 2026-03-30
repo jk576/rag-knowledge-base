@@ -5,6 +5,7 @@
 - Office: Unstructured (docx, xlsx, pptx)
 - 图片: pytesseract (OCR)
 - 文本: 直接读取
+- 代码: CommentExtractor (只提取注释)
 """
 
 import logging
@@ -22,16 +23,30 @@ class DocumentProcessor:
 
     Office 文档 (docx/xlsx/pptx) 优先使用 Unstructured 解析，
     失败时回退到原生解析器。
+    
+    代码文件只提取注释，不提取代码本身。
     """
 
     def __init__(self):
         self.mineru_available = self._check_mineru()
         self.unstructured_available = self._check_unstructured()
+        self.comment_extractor = self._init_comment_extractor()
 
         if self.unstructured_available:
             logger.info("✅ Unstructured 解析器已启用")
         if self.mineru_available:
             logger.info("✅ MinerU 解析器已启用")
+        if self.comment_extractor:
+            logger.info("✅ CommentExtractor 已启用（代码注释提取）")
+    
+    def _init_comment_extractor(self):
+        """初始化代码注释提取器"""
+        try:
+            from src.core.comment_extractor import CommentExtractor
+            return CommentExtractor()
+        except ImportError as e:
+            logger.warning(f"CommentExtractor 导入失败: {e}")
+            return None
 
     def _check_mineru(self) -> bool:
         """检查 MinerU 是否可用（通过 Python 3.11 子进程）"""
@@ -407,10 +422,38 @@ class DocumentProcessor:
             raise ValueError(f"图片 OCR 失败: {e}")
 
     def _extract_code(self, file_path: Path) -> str:
-        """提取代码文件"""
+        """提取代码文件 - 只提取注释
+        
+        代码本身不入 RAG 索引，避免分块破坏语法结构。
+        只提取注释部分用于语义搜索。
+        
+        Args:
+            file_path: 文件路径
+            
+        Returns:
+            提取的注释内容（格式化为 Markdown）
+        """
+        # 优先使用 CommentExtractor
+        if self.comment_extractor:
+            try:
+                comments = self.comment_extractor.extract(file_path)
+                if comments:
+                    logger.debug(f"提取代码注释: {file_path.name} - {len(comments)} 字符")
+                    return comments
+                else:
+                    # 没有注释，返回文件元信息
+                    return f"# File: {file_path.name}\n\n[此文件无注释内容]"
+            except ValueError as e:
+                logger.warning(f"注释提取失败: {e}")
+                # 回退到简单的文件信息
+                return f"# File: {file_path.name}\n\n[注释提取失败]"
+        
+        # 回退：返回文件基本信息（不包含代码）
         try:
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-            return f"# File: {file_path.name}\n\n{content}"
+                # 只读取前几行作为文件描述
+                lines = f.readlines()[:10]
+                preview = "\n".join(lines)
+            return f"# File: {file_path.name}\n\n[代码文件 - 前10行预览]\n\n{preview}"
         except Exception as e:
             raise ValueError(f"代码文件读取失败: {e}")
