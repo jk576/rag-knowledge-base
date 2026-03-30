@@ -306,7 +306,11 @@ class ConsistencyChecker:
             pass  # 目录不为空或无法删除
     
     def _check_missing_files(self):
-        """检查缺失的文件（原目录有但RAG中没有）"""
+        """检查缺失的文件（原目录有但RAG中没有）
+        
+        注意：只统计支持的文件类型（文档和图片）
+        代码和配置文件不入索引，不统计为 missing
+        """
         if not self.watch_root.exists():
             return
         
@@ -318,9 +322,14 @@ class ConsistencyChecker:
         for doc in docs:
             rag_files.add(doc.filename)
         
-        # 扫描原目录
+        # 扫描原目录（只统计支持的文件类型）
         for file_path in self.watch_root.rglob("*"):
             if file_path.is_file():
+                # 检查是否是支持的文件类型
+                ext = file_path.suffix.lower()
+                if ext not in SUPPORTED_EXTENSIONS:
+                    continue  # 跳过代码、配置等不支持的文件
+                
                 rel_path = str(file_path.relative_to(self.watch_root))
                 if rel_path not in rag_files:
                     self.stats["missing_files"] += 1
