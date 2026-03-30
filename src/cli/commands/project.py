@@ -306,3 +306,58 @@ def stats(
     table.add_row("更新时间", project.get("updated_at", "-")[:10] if project.get("updated_at") else "-")
     
     console.print(table)
+
+
+@app.command("clean-orphan")
+def clean_orphan_projects(
+    dry_run: bool = typer.Option(False, "--dry-run", help="只显示，不实际删除"),
+):
+    """
+    清理孤儿项目（文件夹已删除但数据库记录存在）
+    
+    扫描所有项目，检查其对应的文件夹是否存在。
+    如果文件夹已删除，则删除项目及其所有数据（文档、分块、向量）。
+    
+    用法：
+      ragctl project clean-orphan           # 检查并清理孤儿项目
+      ragctl project clean-orphan --dry-run # 只显示，不实际删除
+    """
+    result = api_client.post("/api/v1/projects/clean-orphan", json_data={"dry_run": dry_run})
+    
+    if not result or not result.get("success"):
+        console.print("[red]清理孤儿项目失败[/red]")
+        if result:
+            console.print(f"[red]{result.get('message', '未知错误')}[/red]")
+        return
+    
+    data = result.get("data", {})
+    orphan_projects = data.get("orphan_projects", [])
+    
+    if not orphan_projects:
+        console.print("[green]✓ 没有发现孤儿项目[/green]")
+        return
+    
+    console.print(f"\n[bold cyan]发现 {len(orphan_projects)} 个孤儿项目（文件夹已删除）[/bold cyan]\n")
+    
+    table = Table()
+    table.add_column("项目名称", style="magenta")
+    table.add_column("文档数", style="yellow")
+    table.add_column("分块数", style="yellow")
+    
+    total_docs = 0
+    total_chunks = 0
+    for p in orphan_projects:
+        docs = p.get("document_count", 0)
+        chunks = p.get("chunk_count", 0)
+        total_docs += docs
+        total_chunks += chunks
+        table.add_row(p.get("name", "-"), str(docs), str(chunks))
+    
+    console.print(table)
+    
+    console.print(f"\n[dim]总计: {total_docs} 文档, {total_chunks} 分块[/dim]")
+    
+    if dry_run:
+        console.print("\n[yellow]⚠️ 仅显示，未实际删除（使用不带 --dry-run 的命令执行删除）[/yellow]")
+    else:
+        console.print(f"\n[green]✓ 已清理 {len(orphan_projects)} 个孤儿项目[/green]")
