@@ -105,10 +105,24 @@ class VectorStore:
         project_id: str,
         vectors: List[List[float]],
         payloads: List[Dict[str, Any]],
-    ) -> List[str]:
-        """批量添加向量"""
+    ) -> List[Optional[str]]:
+        """批量添加向量
+        
+        Returns:
+            与输入等长的 ID 列表，失败位置返回 None
+            
+        Raises:
+            ValueError: 批量添加失败时抛出异常（不返回空列表）
+        """
+        if not vectors or not payloads:
+            return []
+        
+        if len(vectors) != len(payloads):
+            raise ValueError("vectors 和 payloads 长度不一致")
+        
         collection_name = self._get_collection_name(project_id)
-
+        
+        # 尝试批量添加
         try:
             point_ids = [str(uuid.uuid4()) for _ in vectors]
             points = [
@@ -127,6 +141,9 @@ class VectorStore:
             return point_ids
         except Exception as e:
             logger.error(f"批量添加向量失败: {e}")
+            # ⚠️ 不返回空列表！抛出异常让调用方处理
+            # 调用方（document_service）会保留 chunks，可后续重新处理
+            raise RuntimeError(f"批量添加向量失败: {e}")
             return []
 
     def search(

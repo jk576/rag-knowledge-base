@@ -1,10 +1,11 @@
-"""文本分块器"""
+"""文本分块器 - 统一入口"""
 
 import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Union
 from pathlib import Path
 
 from src.rag_api.config import get_settings
+from src.core.semantic_chunker import SemanticChunker, get_semantic_chunker
 
 settings = get_settings()
 
@@ -28,52 +29,81 @@ class ChunkWithMetadata:
 
 
 class TextChunker:
-    """文本分块器"""
+    """文本分块器 - 统一入口
+    
+    根据 USE_SEMANTIC_CHUNKING 配置选择分块策略：
+    - True: 使用启发式语义分块（推荐）
+    - False: 使用传统分块方法
+    """
     
     def __init__(
         self,
         chunk_size: int = None,
         chunk_overlap: int = None,
         separators: List[str] = None,
+        use_semantic: bool = None,
     ):
         self.chunk_size = chunk_size or settings.CHUNK_SIZE
         self.chunk_overlap = chunk_overlap or settings.CHUNK_OVERLAP
         self.separators = separators or settings.CHUNK_SEPARATORS
+        
+        # 决定使用哪种分块策略
+        self.use_semantic = use_semantic if use_semantic is not None else settings.USE_SEMANTIC_CHUNKING
+        
+        if self.use_semantic:
+            # 使用启发式语义分块器
+            self._semantic_chunker = SemanticChunker(
+                target_chunk_size=self.chunk_size,
+                max_chunk_size=settings.MAX_CHUNK_SIZE,
+                min_chunk_size=settings.MIN_CHUNK_SIZE,
+                chunk_overlap=self.chunk_overlap,
+            )
+        else:
+            self._semantic_chunker = None
     
     def chunk_text(self, text: str) -> List[str]:
-        """对文本进行分块"""
+        """对文本进行分块
+        
+        自动选择分块策略：
+        - 启用语义分块：使用启发式语义边界 + 长度保护
+        - 未启用：使用传统分块方法
+        """
         if not text:
             return []
         
-        # 清洗文本
-        text = self._clean_text(text)
+        if self.use_semantic and self._semantic_chunker:
+            # 使用启发式语义分块
+            return self._semantic_chunker.chunk_text(text)
         
-        # 如果文本长度小于块大小，直接返回
-        if len(text) <= self.chunk_size:
-            return [text] if text.strip() else []
-        
-        chunks = []
-        
-        # 尝试按分隔符分块
-        for separator in self.separators:
-            chunks = self._split_by_separator(text, separator)
-            if len(chunks) > 1:
-                break
-        
-        # 如果还是没有分块，强制按字符切分
-        if len(chunks) <= 1:
-            chunks = self._split_by_characters(text)
-        
-        # 合并小片段
-        chunks = self._merge_small_chunks(chunks)
-        
-        return chunks
+        # 传统分块方法（向后兼容）
+        return self._legacy_chunk_text(text)
     
     def chunk_text_with_location(self, text: str, file_path: str = None) -> List[ChunkWithMetadata]:
-        """对文本进行分块，保留行号信息"""
+        """对文本进行分块，保留行号信息
+        
+        自动选择分块策略：
+        - 启用语义分块：使用启发式语义边界 + 长度保护
+        - 未启用：使用传统分块方法
+        """
         if not text:
             return []
         
+        # 优先使用语义分块器
+        if self.use_semantic and self._semantic_chunker:
+            semantic_chunks = self._semantic_chunker.chunk_text_with_metadata(text, file_path)
+            # 转换为 ChunkWithMetadata 格式
+            # 注意：语义分块器返回的 start_line/end_line 在顶层，不在 metadata 里
+            return [
+                ChunkWithMetadata(
+                    content=c["content"],
+                    start_line=c.get("start_line", 1),
+                    end_line=c.get("end_line", 1),
+                    metadata=c.get("metadata", {})
+                )
+                for c in semantic_chunks
+            ]
+        
+        # 传统分块方法（向后兼容）
         lines = text.split('\n')
         total_lines = len(lines)
         
@@ -215,30 +245,148 @@ class TextChunker:
                 chunks.append(chunk)
             
             # 计算下一个起始位置（考虑重叠）
-            start = end - self.chunk_overlap
-            if start <= 0 or start >= len(text):
+            next_start = end - self.chunk_overlap
+            
+            # 边界检查：防止死循环和内容丢失
+            if next_start >= len(text):
+                # 已到达末尾，退出
                 break
+            
+            if next_start <= start:
+                # 重叠过大或重叠为负，从当前位置继续
+                # 确保至少前进一小步，避免死循环
+                next_start = min(start + 1, len(text) - 1)
+            
+            start = next_start
         
         return chunks
     
     def _merge_small_chunks(self, chunks: List[str]) -> List[str]:
-        """合并过小的块"""
+        """合并过小的块（传统方法）"""
         if not chunks:
             return chunks
         
         min_size = self.chunk_size * 0.3  # 最小30%
+        max_size = settings.MAX_CHUNK_SIZE  # 确保不超过硬性上限
         merged = []
         current = chunks[0]
         
         for chunk in chunks[1:]:
-            if len(current) < min_size and len(current) + len(chunk) <= self.chunk_size:
+            # 合并条件：当前块太小，且合并后不超过上限
+            if len(current) < min_size and len(current) + len(chunk) + 2 <= max_size:
                 current += "\n\n" + chunk
             else:
                 merged.append(current)
                 current = chunk
         
         merged.append(current)
-        return merged
+        
+        # 最终检查：确保所有 chunk 不超过硬性上限
+        final_merged = []
+        for chunk in merged:
+            if len(chunk) > max_size:
+                # 超长 chunk 需要二次切分
+                sub_chunks = self._split_overlong_chunk(chunk)
+                final_merged.extend(sub_chunks)
+            else:
+                final_merged.append(chunk)
+        
+        return final_merged
+    
+    def _split_overlong_chunk(self, chunk: str) -> List[str]:
+        """切分超长 chunk（确保不超过 MAX_CHUNK_SIZE）"""
+        max_size = settings.MAX_CHUNK_SIZE
+        
+        if len(chunk) <= max_size:
+            return [chunk]
+        
+        # 尝试在句子边界切分
+        sub_chunks = []
+        start = 0
+        
+        while start < len(chunk):
+            end = min(start + max_size, len(chunk))
+            
+            if end < len(chunk):
+                # 尝试找到边界
+                search_text = chunk[start:end]
+                for sep in ["\n\n", "。", "；", "\n", " ", ""]:
+                    last_sep = search_text.rfind(sep)
+                    if last_sep > max_size * 0.5:
+                        end = start + last_sep + len(sep)
+                        break
+            
+            sub_chunk = chunk[start:end].strip()
+            if sub_chunk:
+                sub_chunks.append(sub_chunk)
+            start = end
+        
+        return sub_chunks
+    
+    def _legacy_chunk_text(self, text: str) -> List[str]:
+        """传统分块方法（向后兼容）"""
+        # 清洗文本
+        text = self._clean_text(text)
+        
+        # 硬性上限检查：如果文本本身就超长，需要特殊处理
+        max_size = settings.MAX_CHUNK_SIZE
+        if len(text) > max_size * 2:
+            # 超长文本，需要先切分再处理
+            return self._split_overlong_text(text)
+        
+        # 如果文本长度小于块大小，直接返回
+        if len(text) <= self.chunk_size:
+            return [text] if text.strip() else []
+        
+        chunks = []
+        
+        # 尝试按分隔符分块
+        for separator in self.separators:
+            chunks = self._split_by_separator(text, separator)
+            if len(chunks) > 1:
+                break
+        
+        # 如果还是没有分块，强制按字符切分
+        if len(chunks) <= 1:
+            chunks = self._split_by_characters(text)
+        
+        # 合并小片段（确保不超过上限）
+        chunks = self._merge_small_chunks(chunks)
+        
+        return chunks
+    
+    def _split_overlong_text(self, text: str) -> List[str]:
+        """切分超长文本（特殊处理）"""
+        max_size = settings.MAX_CHUNK_SIZE
+        
+        # 先按段落切分
+        paragraphs = text.split("\n\n")
+        
+        chunks = []
+        current = ""
+        
+        for para in paragraphs:
+            para = para.strip()
+            if not para:
+                continue
+            
+            if len(current) + len(para) + 2 <= max_size:
+                current = current + "\n\n" + para if current else para
+            else:
+                if current:
+                    chunks.append(current)
+                
+                # 如果单个段落就超长，需要进一步切分
+                if len(para) > max_size:
+                    sub_chunks = self._split_by_characters(para)
+                    chunks.extend(sub_chunks)
+                else:
+                    current = para
+        
+        if current:
+            chunks.append(current)
+        
+        return chunks
     
     def chunk_markdown(self, text: str) -> List[dict]:
         """对 Markdown 按标题分块"""

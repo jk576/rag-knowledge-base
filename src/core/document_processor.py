@@ -395,20 +395,36 @@ class DocumentProcessor:
             raise ValueError(f"文本读取失败: {e}")
 
     def _extract_image(self, file_path: Path) -> str:
-        """提取图片文本 (OCR)"""
+        """提取图片文本 (OCR)
+        
+        Returns:
+            提取的文本内容
+            
+        Raises:
+            ValueError: OCR 失败或无文本内容时抛出异常
+                       （不返回占位文本，避免污染搜索质量）
+        """
         try:
             from PIL import Image
             import pytesseract
 
+            # 确保 file_path 是 Path 对象
+            if isinstance(file_path, str):
+                file_path = Path(file_path)
+
             image = Image.open(file_path)
             text = pytesseract.image_to_string(image, lang='chi_sim+eng')
 
+            # OCR 无结果时抛出异常，不返回占位文本
             if not text.strip():
-                return f"[图片: {file_path.name}]\n\n[未识别到文本内容]"
+                raise ValueError(f"图片 OCR 未识别到文本内容: {file_path.name}")
 
             return f"[图片: {file_path.name}]\n\n{text}"
 
         except ImportError:
             raise ValueError("pytesseract 或 Pillow 未安装，无法处理图片")
         except Exception as e:
+            # 保留原始异常信息
+            if isinstance(e, ValueError):
+                raise
             raise ValueError(f"图片 OCR 失败: {e}")

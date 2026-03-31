@@ -250,12 +250,13 @@ class ConsistencyChecker:
     def _cleanup_orphaned_document(self, doc: DocumentModel):
         """清理单个孤儿文档"""
         try:
-            chunk_count = doc.chunk_count
-            
             # 删除向量
             chunks = self.db.query(ChunkModel).filter(
                 ChunkModel.document_id == doc.id
             ).all()
+            
+            # 记录实际删除的 chunks 数
+            actual_chunk_count = len(chunks)
             
             for chunk in chunks:
                 if chunk.vector_id:
@@ -275,13 +276,13 @@ class ConsistencyChecker:
             self.db.delete(doc)
             self.db.commit()
             
-            # 更新项目统计
+            # 更新项目统计（使用实际删除的 chunks 数）
             project = self.db.query(ProjectModel).filter(
                 ProjectModel.id == self.project_id
             ).first()
             if project:
                 project.document_count = max(0, project.document_count - 1)
-                project.chunk_count = max(0, project.chunk_count - chunk_count)
+                project.chunk_count = max(0, project.chunk_count - actual_chunk_count)
                 self.db.commit()
             
             self.stats["cleaned"] += 1

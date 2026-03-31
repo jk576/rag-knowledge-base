@@ -22,10 +22,11 @@ from src.rag_api.models.database import Document as DocumentModel
 from src.rag_api.models.database import Project as ProjectModel
 from src.core.chunker import TextChunker, ChunkWithMetadata
 from src.core.document_processor import DocumentProcessor
-from src.core.embedding import EmbeddingService
+from src.core.embedding import EmbeddingService, update_chunk_vector_status
 from src.core.vector_store import VectorStore
 from src.core.bm25_index import bm25_manager
 from src.core.hierarchical_index import hierarchical_index
+from src.core.embedding_queue import get_queue_manager
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -65,14 +66,22 @@ class DocumentService:
     - FileSync (sync.py): 文件系统自动同步
     - IngestService (ingest_service.py): API 手动上传
     - Reindex scripts: 重新索引脚本
+    
+    队列化模式：
+    - 新文档入库时将 chunks 写入 embedding_queue
+    - Worker 后台逐个处理，避免 Ollama 并发冲击
     """
     
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, use_queue: bool = True):
         self.db = db
         self.processor = DocumentProcessor()
         self.chunker = TextChunker()
         self.embedding = EmbeddingService()
         self.vector_store = VectorStore()
+        self.use_queue = use_queue  # 是否使用队列化模式
+        
+        if use_queue:
+            self.queue_manager = get_queue_manager()
     
     def process_document(
         self,
@@ -156,19 +165,33 @@ class DocumentService:
             if on_progress:
                 on_progress("vectorize", 75, 100)
             
-            # 3. 向量化并保存
+            # 3. 向量化并保存（队列模式或直接模式）
             logger.info(f"[{doc_id}] 向量化...")
-            vector_result = self._vectorize_and_save_chunks(
-                chunks=chunk_objects,
-                document_id=doc_id,
-                project_id=project_id,
-                filename=actual_filename,
-                source_path=source_path  # 传递原始文件路径
-            )
+            
+            if self.use_queue:
+                # 队列化模式：写入队列，Worker 后台处理
+                vector_result = self._save_chunks_to_queue(
+                    chunks=chunk_objects,
+                    document_id=doc_id,
+                    project_id=project_id,
+                    filename=actual_filename,
+                    source_path=source_path
+                )
+            else:
+                # 直接模式：立即向量化（用于重新索引等场景）
+                vector_result = self._vectorize_and_save_chunks(
+                    chunks=chunk_objects,
+                    document_id=doc_id,
+                    project_id=project_id,
+                    filename=actual_filename,
+                    source_path=source_path
+                )
             
             # 4. 更新文档状态
+            # chunk_count 记录实际创建的分块数（不是成功向量数）
+            # 成功向量数可通过查询 chunks 表 WHERE vector_id IS NOT NULL 获得
+            doc.chunk_count = len(chunk_objects)
             doc.status = "completed" if vector_result["success_count"] > 0 else "failed"
-            doc.chunk_count = vector_result["success_count"]
             # 使用详细的错误信息
             if vector_result.get("error_details"):
                 doc.error_message = vector_result["error_details"]
@@ -183,7 +206,7 @@ class DocumentService:
             self._update_project_stats(
                 project_id=project_id,
                 old_chunk_count=old_chunk_count,
-                new_chunk_count=vector_result["success_count"],
+                new_chunk_count=len(chunk_objects),  # 使用实际创建的分块数
                 is_new_document=(document_id is None)
             )
             
@@ -361,16 +384,25 @@ class DocumentService:
             try:
                 emb = self.embedding.embed_text_sync(c.content)
                 if not emb or len(emb) == 0:
-                    vectorization_errors.append(f"chunk {idx}: 返回空向量")
+                    error_msg = f"chunk {idx}: 返回空向量"
+                    vectorization_errors.append(error_msg)
                     embeddings.append(None)
+                    # 更新 chunk 状态为失败
+                    update_chunk_vector_status(c.id, "failed", error_msg)
                 elif all(v == 0.0 for v in emb):
-                    vectorization_errors.append(f"chunk {idx}: 零向量（可能服务未就绪）")
+                    error_msg = f"chunk {idx}: 零向量（可能服务未就绪）"
+                    vectorization_errors.append(error_msg)
                     embeddings.append(None)
+                    # 更新 chunk 状态为失败
+                    update_chunk_vector_status(c.id, "failed", error_msg)
                 else:
                     embeddings.append(emb)
             except Exception as e:
-                vectorization_errors.append(f"chunk {idx}: {str(e)[:50]}")
+                error_msg = f"chunk {idx}: {str(e)[:50]}"
+                vectorization_errors.append(error_msg)
                 embeddings.append(None)
+                # 更新 chunk 状态为失败
+                update_chunk_vector_status(c.id, "failed", error_msg)
         
         # 3. 筛选有效的向量化结果
         payloads = []
@@ -415,42 +447,33 @@ class DocumentService:
                     if vector_id:
                         chunk.vector_id = vector_id
                         success_count += 1
+                        # 更新 chunk 状态为成功
+                        update_chunk_vector_status(chunk.id, "success")
                     else:
                         failed_count += 1
-                        # 向量库添加失败，删除该分块
-                        self.db.delete(chunk)
+                        # ⚠️ 不删除分块！保留 chunk 待后续重新处理
+                        # vector_id 保持 None，可通过 sync_missing_vectors.py 重新处理
+                        logger.warning(f"Chunk {chunk.id} 向量写入失败，保留待后续处理")
                 
             except Exception as e:
                 logger.error(f"[{document_id}] 添加向量失败: {e}")
                 error_details.append(f"向量库添加失败: {str(e)[:50]}")
-                # 所有有效分块都失败
-                for chunk in valid_chunks:
-                    self.db.delete(chunk)
+                # ⚠️ 不删除分块！保留所有 chunks 待后续重新处理
                 failed_count += len(valid_chunks)
+                logger.warning(f"保留 {len(valid_chunks)} 个 chunks 待后续向量化")
         else:
-            # 没有有效的向量，删除所有 chunks
-            logger.warning(f"[{document_id}] 无有效向量，清理所有分块")
-            for chunk in chunk_records:
-                self.db.delete(chunk)
+            # 暂无有效向量，但保留 chunks
+            logger.warning(f"[{document_id}] 暂无有效向量，保留 {len(chunk_records)} 个 chunks 待后续处理")
             failed_count = len(chunk_records)
         
-        # 5. 最终 commit（确保删除操作生效）
+        # 5. 最终 commit
         try:
             self.db.commit()
         except Exception as e:
-            logger.error(f"[{document_id}] 最终 commit 失败: {e}")
+            logger.error(f"[{document_id}] commit 失败: {e}")
             self.db.rollback()
-            # 尝试重新删除残留的 chunks
-            try:
-                remaining_chunks = self.db.query(ChunkModel).filter(
-                    ChunkModel.document_id == document_id
-                ).all()
-                for chunk in remaining_chunks:
-                    if chunk.vector_id is None:  # 只删除无向量的
-                        self.db.delete(chunk)
-                self.db.commit()
-            except Exception as e2:
-                logger.error(f"[{document_id}] 清理残留分块失败: {e2}")
+            # ⚠️ 不删除残留的 chunks，保留待后续处理
+            logger.warning(f"[{document_id}] commit 失败，chunks 保留在数据库中")
         
         # 6. 构建详细错误信息
         if vectorization_errors:
@@ -469,6 +492,94 @@ class DocumentService:
             "success_count": success_count,
             "failed_count": failed_count,
             "error_details": error_message,
+        }
+    
+    def _save_chunks_to_queue(
+        self,
+        chunks: List[ChunkWithMetadata],
+        document_id: str,
+        project_id: str,
+        filename: str,
+        source_path: Optional[str] = None
+    ) -> Dict[str, int]:
+        """队列化模式：保存 chunks 并加入向量化队列
+        
+        流程：
+        1. 保存所有 chunks 到数据库（无 vector_id）
+        2. 加入 embedding_queue 队列
+        3. Worker 后台逐个处理
+        
+        Args:
+            chunks: 分块列表
+            document_id: 文档ID
+            project_id: 项目ID
+            filename: 文件名
+            source_path: 原始文件完整路径
+            
+        Returns:
+            {"success_count": int, "failed_count": int, "queued": int}
+        """
+        if not chunks:
+            return {"success_count": 0, "failed_count": 0, "queued": 0}
+        
+        # 1. 保存所有 chunks 到数据库
+        chunk_records = []
+        for idx, chunk_obj in enumerate(chunks):
+            metadata = {
+                "start_line": chunk_obj.start_line,
+                "end_line": chunk_obj.end_line,
+                "file_path": chunk_obj.metadata.get("file_path"),
+            }
+            
+            if chunk_obj.metadata.get("symbols"):
+                metadata["symbols"] = chunk_obj.metadata["symbols"]
+            
+            chunk = ChunkModel(
+                document_id=document_id,
+                project_id=project_id,
+                content=chunk_obj.content,
+                chunk_index=idx,
+                metadata_json=json.dumps(metadata),
+            )
+            self.db.add(chunk)
+            chunk_records.append(chunk)
+        
+        try:
+            self.db.commit()
+            # 刷新获取 ID
+            for chunk in chunk_records:
+                self.db.refresh(chunk)
+        except Exception as e:
+            logger.error(f"[{document_id}] 保存分块失败: {e}")
+            self.db.rollback()
+            return {"success_count": 0, "failed_count": len(chunks), "queued": 0}
+        
+        # 2. 加入向量化队列
+        queue_items = []
+        for chunk in chunk_records:
+            queue_items.append({
+                "id": chunk.id,
+                "content": chunk.content,
+                "document_id": document_id,
+                "project_id": project_id
+            })
+        
+        queue_result = self.queue_manager.queue_chunks(queue_items)
+        
+        logger.info(
+            f"[{document_id}] 保存 {len(chunk_records)} 个 chunks，"
+            f"队列 {queue_result['queued']} 个"
+        )
+        
+        # 3. 返回结果（实际向量化由 Worker 完成）
+        # 注意：saved_count 是保存的 chunks 数，不是向量化成功数
+        # 向量化进度可通过 queue_manager.get_queue_status() 查询
+        return {
+            "saved_count": len(chunk_records),  # chunks 已保存到数据库
+            "queued": queue_result["queued"],   # 已加入队列待处理
+            "skipped": queue_result["skipped"], # 已存在跳过
+            "failed_count": 0,
+            "error_details": "已加入向量化队列，Worker 将后台处理。向量化进度可通过队列状态查询。"
         }
     
     def _update_project_stats(
@@ -559,12 +670,14 @@ class DocumentService:
                 return False
             
             project_id = doc.project_id
-            chunk_count = doc.chunk_count
             
             # 1. 收集所有向量ID
             chunks = self.db.query(ChunkModel).filter(
                 ChunkModel.document_id == document_id
             ).all()
+            
+            # 记录实际删除的 chunks 数量（用于项目统计更新）
+            actual_chunk_count = len(chunks)
             
             vector_ids_to_delete = []
             failed_vector_deletes = []
@@ -581,12 +694,18 @@ class DocumentService:
                     logger.error(f"删除向量失败 {vector_id}: {e}")
                     failed_vector_deletes.append(vector_id)
             
-            # 3. 如果有向量删除失败，记录但不阻止文档删除
-            # 孤立向量可通过一致性检查清理
+            # 3. 如果有向量删除失败，记录到 orphan_vectors 表
             if failed_vector_deletes:
                 logger.warning(
                     f"文档 {document_id} 有 {len(failed_vector_deletes)} 个向量删除失败，"
-                    "可通过一致性检查清理"
+                    "已记录到 orphan_vectors 表"
+                )
+                # 记录孤儿向量
+                self._record_orphan_vectors(
+                    project_id=project_id,
+                    vector_ids=failed_vector_deletes,
+                    document_id=document_id,
+                    reason="delete_document_failed"
                 )
             
             # 4. 删除所有chunk记录
@@ -616,13 +735,13 @@ class DocumentService:
             self.db.delete(doc)
             self.db.commit()
             
-            # 8. 更新项目统计
+            # 8. 更新项目统计（使用实际删除的 chunks 数）
             project = self.db.query(ProjectModel).filter(
                 ProjectModel.id == project_id
             ).first()
             if project:
                 project.document_count = max(0, project.document_count - 1)
-                project.chunk_count = max(0, project.chunk_count - chunk_count)
+                project.chunk_count = max(0, project.chunk_count - actual_chunk_count)
                 self.db.commit()
             
             logger.info(f"已删除文档: {document_id}")
@@ -646,3 +765,42 @@ class DocumentService:
                 self._cleanup_empty_dirs(dir_path.parent, project_id)
         except OSError:
             pass
+    
+    def _record_orphan_vectors(
+        self,
+        project_id: str,
+        vector_ids: List[str],
+        document_id: Optional[str] = None,
+        chunk_id: Optional[str] = None,
+        reason: str = "unknown"
+    ):
+        """
+        记录孤儿向量到 orphan_vectors 表
+        
+        Args:
+            project_id: 项目 ID
+            vector_ids: 向量 ID 列表
+            document_id: 文档 ID（可选）
+            chunk_id: Chunk ID（可选）
+            reason: 原因
+        """
+        try:
+            from sqlalchemy import text
+            
+            for vector_id in vector_ids:
+                self.db.execute(text("""
+                    INSERT OR IGNORE INTO orphan_vectors 
+                    (project_id, vector_id, chunk_id, reason)
+                    VALUES (:project_id, :vector_id, :chunk_id, :reason)
+                """), {
+                    "project_id": project_id,
+                    "vector_id": vector_id,
+                    "chunk_id": chunk_id,
+                    "reason": reason
+                })
+            
+            self.db.commit()
+            logger.info(f"记录 {len(vector_ids)} 个孤儿向量")
+            
+        except Exception as e:
+            logger.error(f"记录孤儿向量失败: {e}")

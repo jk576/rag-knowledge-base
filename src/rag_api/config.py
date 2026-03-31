@@ -49,9 +49,14 @@ class Settings(BaseSettings):
     MINERU_CONFIG_PATH: Path = Path.home() / ".mineru" / "magic-pdf.json"
     
     # 分块配置
-    CHUNK_SIZE: int = 1000
-    CHUNK_OVERLAP: int = 100
+    CHUNK_SIZE: int = 1000           # 目标分块大小
+    CHUNK_OVERLAP: int = 100         # 重叠大小
+    MAX_CHUNK_SIZE: int = 4000       # 硬性上限（防止 Ollama 超限，古籍内容 token 消耗高）
+    MIN_CHUNK_SIZE: int = 300        # 最小分块大小（防止过碎）
     CHUNK_SEPARATORS: List[str] = ["\n\n", "\n", "。", "；", " ", ""]
+    
+    # 语义分块配置
+    USE_SEMANTIC_CHUNKING: bool = True  # 启用启发式语义分块
     
     # 检索配置
     SEARCH_TOP_K: int = 40
