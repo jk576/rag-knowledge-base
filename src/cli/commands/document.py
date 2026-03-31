@@ -26,14 +26,23 @@ def _resolve_project_id(project: str) -> Optional[str]:
         data = result.get("data", {})
         projects = data if isinstance(data, list) else data.get("items", [])
         
+        # 先尝试精确匹配
+        for p in projects:
+            if isinstance(p, dict) and p.get("name") == project:
+                return p.get("id")
+        
+        # 再尝试模糊匹配（但优先返回最短的匹配，避免误匹配）
+        matches = []
         for p in projects:
             if isinstance(p, dict):
-                # 精确匹配名称
-                if p.get("name") == project:
-                    return p.get("id")
-                # 模糊匹配名称
-                if project.lower() in (p.get("name", "")).lower():
-                    return p.get("id")
+                name = p.get("name", "")
+                if project.lower() in name.lower():
+                    matches.append((len(name), p.get("id")))
+        
+        # 返回名称最短的匹配（最精确）
+        if matches:
+            matches.sort()
+            return matches[0][1]
     
     return project  # 找不到就原样返回，让 API 报错
 
@@ -41,7 +50,7 @@ def _resolve_project_id(project: str) -> Optional[str]:
 @app.command("list")
 def list_documents(
     project: str = typer.Argument(..., help="项目名称或ID"),
-    limit: int = typer.Option(100, "--limit", "-l", help="每页返回数量"),
+    limit: int = typer.Option(100, "--limit", "-l", help="每页返回数量（最大 500）"),
     page: int = typer.Option(1, "--page", "-p", help="页码（从 1 开始）"),
     search: str = typer.Option(None, "--search", "-s", help="文件名搜索"),
     full_id: bool = typer.Option(False, "--full", "-f", help="显示完整 ID"),
@@ -57,6 +66,20 @@ def list_documents(
         ragctl doc list yunxi -s "调研"         # 搜索文件名包含"调研"
         ragctl doc list yunxi -s ".xlsx"        # 搜索所有 Excel 文件
     """
+    # 参数验证
+    if page < 1:
+        console.print("[red]错误: 页码必须大于等于 1[/red]")
+        raise typer.Exit(1)
+    
+    if limit < 1:
+        console.print("[red]错误: 每页数量必须大于等于 1[/red]")
+        raise typer.Exit(1)
+    
+    # 限制最大值，防止内存问题
+    if limit > 500:
+        console.print("[yellow]警告: 每页数量超过 500，已自动限制为 500[/yellow]")
+        limit = 500
+    
     # 解析项目名称为 ID
     project_id = _resolve_project_id(project)
     

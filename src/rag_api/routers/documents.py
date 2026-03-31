@@ -72,11 +72,19 @@ async def list_documents(
     
     Args:
         project_id: 项目 ID
-        skip: 跳过数量（分页偏移）
-        limit: 返回数量（默认 100）
+        skip: 跳过数量（分页偏移，最小 0）
+        limit: 返回数量（默认 100，最大 500）
         filename: 文件名搜索（模糊匹配）
     """
     from src.services.project_service import ProjectService
+    
+    # 参数验证
+    if skip < 0:
+        skip = 0
+    if limit < 1:
+        limit = 100
+    if limit > 500:
+        limit = 500
     
     service = ProjectService(db)
     result = service.list_documents(project_id, skip=skip, limit=limit, filename=filename)
