@@ -232,6 +232,11 @@ class BM25Index:
     def save(self) -> bool:
         """保存索引到磁盘（原子写入）"""
         with self._lock:
+            # 如果有待重建的索引，先重建再保存
+            if self._pending_rebuild:
+                self._rebuild_index()
+                self._pending_rebuild = False
+            
             try:
                 self._index_path.parent.mkdir(parents=True, exist_ok=True)
                 

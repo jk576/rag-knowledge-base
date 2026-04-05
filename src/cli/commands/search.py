@@ -1,15 +1,37 @@
-"""搜索命令"""
+"""搜索命令 - 支持健康检查和超时控制"""
 
 from typing import Optional
 
 import typer
 from rich.console import Console
 
-from src.cli.api_client import api_client
+from src.cli.api_client import api_client, check_api_health, API_SEARCH_TIMEOUT
 from src.cli.utils import truncate_text
 
 app = typer.Typer(name="search", help="搜索")
 console = Console()
+
+# 全局变量控制是否跳过健康检查
+_skip_health_check = False
+
+
+def _perform_health_check() -> bool:
+    """执行搜索前的健康检查
+    
+    Returns:
+        True: 服务健康，可继续执行搜索
+        False: 服务不健康，应终止搜索
+    """
+    health_result = check_api_health()
+    
+    if health_result["healthy"]:
+        console.print(f"[dim]✓ RAG API 健康 ({health_result.get('response_time_ms', 0)}ms)[/dim]")
+        return True
+    else:
+        console.print(f"[red]搜索前检查失败: {health_result['message']}[/red]")
+        console.print(f"[dim]提示：使用 'ragctl service status' 查看服务状态[/dim]")
+        console.print(f"[dim]提示：使用 --skip-health-check 跳过此检查（仅用于调试）[/dim]")
+        return False
 
 
 def _resolve_project_id(project: str) -> Optional[str]:
@@ -43,8 +65,25 @@ def _search(
     top_k: int,
     score_threshold: float,
     full_content: bool = False,
+    skip_health_check: bool = False,
 ):
-    """执行搜索"""
+    """执行搜索
+    
+    Args:
+        project_id: 项目 ID
+        query: 查询内容
+        search_mode: 搜索模式 (semantic/keyword/hybrid/hierarchical)
+        top_k: 返回数量
+        score_threshold: 分数阈值
+        full_content: 是否显示完整内容
+        skip_health_check: 是否跳过健康检查
+    """
+    # 健康检查（除非明确跳过）
+    if not skip_health_check:
+        if not _perform_health_check():
+            console.print("[yellow]已终止搜索[/yellow]")
+            raise typer.Exit(1)
+    
     payload = {
         "project_id": project_id,
         "query": query,
@@ -54,7 +93,8 @@ def _search(
         "rerank": True,
     }
     
-    result = api_client.post("/api/v1/search", json_data=payload)
+    # 使用搜索专用超时
+    result = api_client.post("/api/v1/search", json_data=payload, timeout=API_SEARCH_TIMEOUT)
     
     if not result or not result.get("success"):
         console.print(f"[red]搜索失败: {result.get('message', '未知错误') if result else '无响应'}[/red]")
@@ -121,6 +161,7 @@ def semantic(
     top_k: int = typer.Option(10, "--top-k", "-k", help="返回数量"),
     score_threshold: float = typer.Option(0.0, "--threshold", "-t", help="分数阈值 (0-1)"),
     full: bool = typer.Option(False, "--full", "-f", help="显示完整内容"),
+    skip_health_check: bool = typer.Option(False, "--skip-health-check", help="跳过健康检查（调试用）"),
 ):
     """语义搜索 - 基于向量相似度
     
@@ -130,7 +171,7 @@ def semantic(
     project_id = _resolve_project_id(project)
     if project_id != project:
         console.print(f"[dim]项目: {project} → {project_id[:8]}...[/dim]")
-    _search(project_id, query, "semantic", top_k, score_threshold, full)
+    _search(project_id, query, "semantic", top_k, score_threshold, full, skip_health_check)
 
 
 @app.command()
@@ -140,6 +181,7 @@ def keyword(
     top_k: int = typer.Option(10, "--top-k", "-k", help="返回数量"),
     score_threshold: float = typer.Option(0.0, "--threshold", "-t", help="分数阈值 (0-1)"),
     full: bool = typer.Option(False, "--full", "-f", help="显示完整内容"),
+    skip_health_check: bool = typer.Option(False, "--skip-health-check", help="跳过健康检查（调试用）"),
 ):
     """关键词搜索 - 基于 BM25
     
@@ -149,7 +191,7 @@ def keyword(
     project_id = _resolve_project_id(project)
     if project_id != project:
         console.print(f"[dim]项目: {project} → {project_id[:8]}...[/dim]")
-    _search(project_id, query, "keyword", top_k, score_threshold, full)
+    _search(project_id, query, "keyword", top_k, score_threshold, full, skip_health_check)
 
 
 @app.command()
@@ -159,17 +201,19 @@ def hybrid(
     top_k: int = typer.Option(10, "--top-k", "-k", help="返回数量"),
     score_threshold: float = typer.Option(0.0, "--threshold", "-t", help="分数阈值 (0-1)"),
     full: bool = typer.Option(False, "--full", "-f", help="显示完整内容"),
+    skip_health_check: bool = typer.Option(False, "--skip-health-check", help="跳过健康检查（调试用）"),
 ):
     """混合搜索 - 向量 + BM25 + RRF 融合（推荐）
     
     用法: ragctl search hybrid <项目> <查询>
     示例: ragctl search hybrid yunxi "数据中台架构" -k 5
           ragctl search hybrid yunxi "数据中台架构" -k 1 --full
+          ragctl search hybrid yunxi "数据中台架构" --skip-health-check（调试模式）
     """
     project_id = _resolve_project_id(project)
     if project_id != project:
         console.print(f"[dim]项目: {project} → {project_id[:8]}...[/dim]")
-    _search(project_id, query, "hybrid", top_k, score_threshold, full)
+    _search(project_id, query, "hybrid", top_k, score_threshold, full, skip_health_check)
 
 
 @app.command()
@@ -179,6 +223,7 @@ def hierarchical(
     top_k: int = typer.Option(10, "--top-k", "-k", help="返回数量"),
     score_threshold: float = typer.Option(0.0, "--threshold", "-t", help="分数阈值 (0-1)"),
     full: bool = typer.Option(False, "--full", "-f", help="显示完整内容"),
+    skip_health_check: bool = typer.Option(False, "--skip-health-check", help="跳过健康检查（调试用）"),
 ):
     """层次化搜索 - RAPTOR（文档摘要 + chunks）
     
@@ -190,4 +235,4 @@ def hierarchical(
     project_id = _resolve_project_id(project)
     if project_id != project:
         console.print(f"[dim]项目: {project} → {project_id[:8]}...[/dim]")
-    _search(project_id, query, "hierarchical", top_k, score_threshold, full)
+    _search(project_id, query, "hierarchical", top_k, score_threshold, full, skip_health_check)

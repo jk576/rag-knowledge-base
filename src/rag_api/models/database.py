@@ -1,24 +1,43 @@
 """SQLAlchemy 数据库模型"""
 
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
+from typing import Generator
 
-from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine
+from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, event
+from sqlalchemy.engine import Engine
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker, scoped_session
 
 from src.rag_api.config import get_settings
 
 settings = get_settings()
 
-# 创建引擎
+# 创建引擎 - 添加连接池配置
 engine = create_engine(
     f"sqlite:///{settings.DB_PATH}",
     connect_args={"check_same_thread": False},
     echo=settings.APP_DEBUG,
+    # 连接池配置
+    pool_pre_ping=True,  # 连接前ping，自动回收失效连接
+    pool_recycle=3600,   # 连接1小时后自动回收
+    max_overflow=10,     # 最大溢出连接数
 )
 
+# 监听连接事件，设置SQLite优化参数
+@event.listens_for(Engine, "connect")
+def set_sqlite_pragma(dbapi_conn, connection_record):
+    """设置SQLite优化参数"""
+    cursor = dbapi_conn.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")  # 启用外键
+    cursor.execute("PRAGMA journal_mode=WAL")  # WAL模式，提高并发性能
+    cursor.execute("PRAGMA synchronous=NORMAL")  # 同步模式，平衡性能和安全性
+    cursor.close()
+
+# 线程安全的Session工厂（用于多线程环境如Watcher）
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+ScopedSession = scoped_session(SessionLocal)
 
 Base = declarative_base()
 
@@ -97,10 +116,47 @@ def init_db():
     Base.metadata.create_all(bind=engine)
 
 
-def get_db():
-    """获取数据库会话"""
+def get_db() -> Generator[Session, None, None]:
+    """获取数据库会话（FastAPI依赖使用）"""
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
+
+
+@contextmanager
+def get_db_session() -> Generator[Session, None, None]:
+    """获取数据库会话（上下文管理器，推荐用于多线程环境）
+    
+    使用示例:
+        with get_db_session() as db:
+            result = db.query(Project).first()
+            # 自动commit/rollback
+    """
+    db = ScopedSession()
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+        ScopedSession.remove()  # 清理线程本地存储
+
+
+def get_db_session_sync() -> Session:
+    """获取数据库会话（同步方式，需手动管理）
+    
+    使用示例:
+        db = get_db_session_sync()
+        try:
+            result = db.query(Project).first()
+            db.commit()
+        except Exception:
+            db.rollback()
+        finally:
+            db.close()
+    """
+    return ScopedSession()

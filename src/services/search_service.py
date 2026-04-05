@@ -290,8 +290,8 @@ class SearchService:
         for search_type, type_hits in type_results.items():
             for rank, result in enumerate(type_hits):
                 chunk_id = result.chunk_id
-                # RRF 分数
-                rank_scores[chunk_id] += 1.0 / (k + rank)
+                # RRF 分数（标准公式：rank 从 1 开始，需加 1）
+                rank_scores[chunk_id] += 1.0 / (k + rank + 1)
                 
                 if chunk_id not in items:
                     items[chunk_id] = result

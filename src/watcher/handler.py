@@ -16,6 +16,7 @@ from watchdog.observers import Observer
 
 from src.watcher.gitignore import gitignore_cache
 from src.watcher.sync import ConsistencyChecker, FileSync, ProjectMapping, SyncStats
+from src.rag_api.models.database import get_db_session
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ class EventDebouncer:
         self._pending_events: Dict[Path, FileEvent] = {}
         self._lock = threading.Lock()
         self._timer: Optional[threading.Timer] = None
+        self._timer_lock = threading.Lock()  # 专门用于timer操作的锁
     
     def set_callback(self, callback: Callable) -> None:
         self._callback = callback
@@ -57,26 +59,38 @@ class EventDebouncer:
                     event.event_type = "modified"
             
             self._pending_events[key] = event
-            
-            # 取消现有定时器并创建新的
+        
+        # 在锁外操作timer，避免死锁
+        self._reset_timer()
+        
+        logger.debug(f"Event added: {event.event_type} for {key}, will process in {self.debounce_interval}s")
+    
+    def _reset_timer(self) -> None:
+        """重置定时器 - 使用单独的锁保护"""
+        with self._timer_lock:
+            # 取消现有定时器
             if self._timer:
                 self._timer.cancel()
+                self._timer = None
             
+            # 创建新定时器
             self._timer = threading.Timer(
                 self.debounce_interval,
                 self._process_events
             )
             self._timer.start()
-            
-            logger.debug(f"Event added: {event.event_type} for {key}, will process in {self.debounce_interval}s")
     
     def _process_events(self) -> None:
         """在定时器线程中处理事件"""
+        # 先获取事件，再释放锁
         with self._lock:
             if not self._pending_events:
                 return
             events = list(self._pending_events.values())
             self._pending_events.clear()
+        
+        # 在timer锁中清理timer引用
+        with self._timer_lock:
             self._timer = None
         
         if self._callback and events:
@@ -88,11 +102,14 @@ class EventDebouncer:
     
     def flush(self) -> None:
         """立即处理所有待处理事件"""
-        with self._lock:
+        # 先取消timer
+        with self._timer_lock:
             if self._timer:
                 self._timer.cancel()
                 self._timer = None
-            
+        
+        # 再获取事件
+        with self._lock:
             if not self._pending_events:
                 return
             events = list(self._pending_events.values())
@@ -105,10 +122,13 @@ class EventDebouncer:
                 logger.error(f"Error flushing events: {e}")
     
     def clear(self) -> None:
-        with self._lock:
+        """清空所有待处理事件"""
+        with self._timer_lock:
             if self._timer:
                 self._timer.cancel()
                 self._timer = None
+        
+        with self._lock:
             self._pending_events.clear()
 
 
@@ -190,12 +210,13 @@ class FileChangeHandler(FileSystemEventHandler):
         """批量处理事件 - 在定时器线程中执行"""
         if self._processing:
             logger.warning("Previous batch still processing")
+            return
         
         self._processing = True
         
         try:
-            db = self.db_session_factory()
-            try:
+            # 使用上下文管理器，自动处理commit/rollback/close
+            with get_db_session() as db:
                 project_mapping = ProjectMapping(db)
                 project = project_mapping.get_or_create_project(self.watch_root, self.project_name)
                 file_sync = FileSync(db, str(project.id))
@@ -209,8 +230,6 @@ class FileChangeHandler(FileSystemEventHandler):
                 
                 from datetime import datetime
                 self.stats.last_sync = datetime.now()
-            finally:
-                db.close()
         except Exception as e:
             logger.error(f"Error in batch processing: {e}")
         finally:
@@ -267,37 +286,38 @@ class FileChangeHandler(FileSystemEventHandler):
         if not directory.exists():
             return
         
-        db = self.db_session_factory()
         try:
-            project_mapping = ProjectMapping(db)
-            project = project_mapping.get_or_create_project(self.watch_root, self.project_name)
-            
-            # 首先执行一致性检查（清理孤儿文件）
-            checker = ConsistencyChecker(db, str(project.id), self.watch_root)
-            check_stats = checker.check_and_fix()
-            
-            if check_stats['orphaned_files'] > 0:
-                logger.info(f"一致性检查: 清理了 {check_stats['cleaned']}/{check_stats['orphaned_files']} 个孤儿文件")
-            
-            # 然后执行正常同步
-            file_sync = FileSync(db, str(project.id))
-            
-            for file_path in directory.rglob("*"):
-                if file_path.is_file() and self.gitignore.should_process(file_path):
-                    rel_path = self._get_relative_path(file_path)
-                    if rel_path:
-                        try:
-                            # 使用同步方法
-                            result = file_sync.sync_file(file_path, rel_path)
-                            if result["status"] == "created":
-                                self.stats.created += 1
-                            elif result["status"] == "updated":
-                                self.stats.updated += 1
-                        except Exception as e:
-                            logger.error(f"Error syncing file {file_path}: {e}")
-                            self.stats.errors += 1
-        finally:
-            db.close()
+            # 使用上下文管理器，自动处理commit/rollback/close
+            with get_db_session() as db:
+                project_mapping = ProjectMapping(db)
+                project = project_mapping.get_or_create_project(self.watch_root, self.project_name)
+                
+                # 首先执行一致性检查（清理孤儿文件）
+                checker = ConsistencyChecker(db, str(project.id), self.watch_root)
+                check_stats = checker.check_and_fix()
+                
+                if check_stats['orphaned_files'] > 0:
+                    logger.info(f"一致性检查: 清理了 {check_stats['cleaned']}/{check_stats['orphaned_files']} 个孤儿文件")
+                
+                # 然后执行正常同步
+                file_sync = FileSync(db, str(project.id))
+                
+                for file_path in directory.rglob("*"):
+                    if file_path.is_file() and self.gitignore.should_process(file_path):
+                        rel_path = self._get_relative_path(file_path)
+                        if rel_path:
+                            try:
+                                # 使用同步方法
+                                result = file_sync.sync_file(file_path, rel_path)
+                                if result["status"] == "created":
+                                    self.stats.created += 1
+                                elif result["status"] == "updated":
+                                    self.stats.updated += 1
+                            except Exception as e:
+                                logger.error(f"Error syncing file {file_path}: {e}")
+                                self.stats.errors += 1
+        except Exception as e:
+            logger.error(f"Error scanning directory {directory}: {e}")
     
     def get_stats(self) -> Dict[str, Any]:
         return {
@@ -358,12 +378,12 @@ class ProjectDirectoryHandler:
         if project_name in self.project_handlers:
             del self.project_handlers[project_name]
         
-        db = self.db_session_factory()
         try:
-            project_mapping = ProjectMapping(db)
-            project_mapping.delete_project_by_name(project_name)
-        finally:
-            db.close()
+            with get_db_session() as db:
+                project_mapping = ProjectMapping(db)
+                project_mapping.delete_project_by_name(project_name)
+        except Exception as e:
+            logger.error(f"Error deleting project {project_name}: {e}")
     
     def on_project_moved(self, src_path: Path, dest_path: Path) -> None:
         old_name = src_path.name
@@ -378,12 +398,12 @@ class ProjectDirectoryHandler:
             handler.watch_root = dest_path
             self.project_handlers[new_name] = handler
         
-        db = self.db_session_factory()
         try:
-            project_mapping = ProjectMapping(db)
-            project_mapping.update_project_name(old_name, new_name)
-        finally:
-            db.close()
+            with get_db_session() as db:
+                project_mapping = ProjectMapping(db)
+                project_mapping.update_project_name(old_name, new_name)
+        except Exception as e:
+            logger.error(f"Error moving project {old_name} to {new_name}: {e}")
     
     def get_all_project_paths(self) -> List[Path]:
         if not self.projects_root.exists():

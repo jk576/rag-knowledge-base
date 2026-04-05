@@ -13,7 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 
 from watchdog.observers import Observer
 
-from src.rag_api.models.database import SessionLocal
+from src.rag_api.models.database import SessionLocal, get_db_session
 from src.watcher.handler import FileChangeHandler, ProjectDirectoryHandler
 from src.watcher.sync import SyncStats
 
@@ -98,10 +98,6 @@ class WatcherManager:
         self._initialized = True
         logger.info(f"WatcherManager initialized with root: {self.projects_root}")
     
-    def _get_db_session(self):
-        """获取数据库会话"""
-        return SessionLocal()
-    
     def _scan_project(self, handler, project_path: Path, project_name: str) -> None:
         """在后台线程扫描项目目录"""
         try:
@@ -121,20 +117,18 @@ class WatcherManager:
         Returns:
             是否启用监控（如果项目不存在或出错，默认返回 False）
         """
-        db = self._get_db_session()
         try:
-            from src.rag_api.models.database import Project as ProjectModel
-            project = db.query(ProjectModel).filter(
-                ProjectModel.name == project_name
-            ).first()
-            if project:
-                return bool(project.watcher_enabled)
-            return False
+            with get_db_session() as db:
+                from src.rag_api.models.database import Project as ProjectModel
+                project = db.query(ProjectModel).filter(
+                    ProjectModel.name == project_name
+                ).first()
+                if project:
+                    return bool(project.watcher_enabled)
+                return False
         except Exception as e:
             logger.error(f"Error querying watcher_enabled for {project_name}: {e}")
             return False
-        finally:
-            db.close()
     
     def _is_project_watched(self, project_name: str) -> bool:
         """检查项目是否正在被监控"""
@@ -343,16 +337,17 @@ class WatcherManager:
                 
                 # 检查项目是否存在于数据库，如果不存在则自动创建
                 from src.watcher.sync import ProjectMapping
-                db = self._get_db_session()
                 try:
-                    project_mapping = ProjectMapping(db)
-                    project = project_mapping.get_project_by_name(project_name)
-                    if not project:
-                        # 新项目：自动创建并启用监控
-                        project = project_mapping.get_or_create_project(project_path, project_name)
-                        logger.info(f"Auto-created new project: {project_name} (watcher_enabled={project.watcher_enabled})")
-                finally:
-                    db.close()
+                    with get_db_session() as db:
+                        project_mapping = ProjectMapping(db)
+                        project = project_mapping.get_project_by_name(project_name)
+                        if not project:
+                            # 新项目：自动创建并启用监控
+                            project = project_mapping.get_or_create_project(project_path, project_name)
+                            logger.info(f"Auto-created new project: {project_name} (watcher_enabled={project.watcher_enabled})")
+                except Exception as e:
+                    logger.error(f"Error checking/creating project {project_name}: {e}")
+                    continue
                 
                 # 检查项目的 watcher_enabled 状态
                 if not self._get_project_watcher_enabled(project_name):
@@ -363,7 +358,7 @@ class WatcherManager:
                 handler = FileChangeHandler(
                     watch_root=project_path,
                     project_name=project_name,
-                    db_session_factory=self._get_db_session,
+                    db_session_factory=get_db_session,  # 传递上下文管理器
                     debounce_interval=self.debounce_interval,
                 )
                 
@@ -529,16 +524,17 @@ class WatcherManager:
         
         # 检查项目是否存在于数据库，如果不存在则自动创建
         from src.watcher.sync import ProjectMapping
-        db = self._get_db_session()
         try:
-            project_mapping = ProjectMapping(db)
-            project = project_mapping.get_project_by_name(project_name)
-            if not project:
-                # 新项目：自动创建并启用监控
-                project = project_mapping.get_or_create_project(project_path, project_name)
-                logger.info(f"Auto-created new project on-the-fly: {project_name} (watcher_enabled={project.watcher_enabled})")
-        finally:
-            db.close()
+            with get_db_session() as db:
+                project_mapping = ProjectMapping(db)
+                project = project_mapping.get_project_by_name(project_name)
+                if not project:
+                    # 新项目：自动创建并启用监控
+                    project = project_mapping.get_or_create_project(project_path, project_name)
+                    logger.info(f"Auto-created new project on-the-fly: {project_name} (watcher_enabled={project.watcher_enabled})")
+        except Exception as e:
+            logger.error(f"Error creating project {project_name}: {e}")
+            return
         
         # 检查 watcher_enabled 状态，只有启用时才添加监控
         if not self._get_project_watcher_enabled(project_name):
@@ -549,7 +545,7 @@ class WatcherManager:
         handler = FileChangeHandler(
             watch_root=project_path,
             project_name=project_name,
-            db_session_factory=self._get_db_session,
+            db_session_factory=get_db_session,
             debounce_interval=self.debounce_interval,
         )
         
@@ -834,44 +830,40 @@ class WatcherManager:
             
             # 检查每个项目的向量索引状态
             for project_name, handler in list(self._project_handlers.items()):
-                db = None
                 try:
-                    db = self._get_db_session()
-                    project = db.query(Project).filter(
-                        Project.name == project_name
-                    ).first()
-                    if not project:
-                        continue
-                    
-                    project_id = str(project.id)
-                    collection_name = f"project_{project_id}"
-                    info = vector_store.client.get_collection(collection_name)
-                    
-                    # 如果有向量但没有索引，发出警告
-                    if info.points_count > 100 and info.indexed_vectors_count == 0:
-                        logger.warning(
-                            f"⚠️ 项目 {project_name} 有 {info.points_count} 个向量但未索引！"
-                            f"搜索性能可能受影响。"
-                        )
-                    
-                    # 检查向量数量一致性
-                    db_chunk_count = db.query(Chunk).filter(
-                        Chunk.project_id == project_id
-                    ).count()
-                    qdrant_count = info.points_count
-                    
-                    # 允许 5% 的差异（因为索引延迟）
-                    if abs(db_chunk_count - qdrant_count) > max(db_chunk_count, qdrant_count) * 0.05:
-                        logger.warning(
-                            f"⚠️ 项目 {project_name} 向量数量不一致: "
-                            f"数据库 {db_chunk_count} vs Qdrant {qdrant_count}"
-                        )
+                    with get_db_session() as db:
+                        project = db.query(Project).filter(
+                            Project.name == project_name
+                        ).first()
+                        if not project:
+                            continue
+                        
+                        project_id = str(project.id)
+                        collection_name = f"project_{project_id}"
+                        info = vector_store.client.get_collection(collection_name)
+                        
+                        # 如果有向量但没有索引，发出警告
+                        if info.points_count > 100 and info.indexed_vectors_count == 0:
+                            logger.warning(
+                                f"⚠️ 项目 {project_name} 有 {info.points_count} 个向量但未索引！"
+                                f"搜索性能可能受影响。"
+                            )
+                        
+                        # 检查向量数量一致性
+                        db_chunk_count = db.query(Chunk).filter(
+                            Chunk.project_id == project_id
+                        ).count()
+                        qdrant_count = info.points_count
+                        
+                        # 允许 5% 的差异（因为索引延迟）
+                        if abs(db_chunk_count - qdrant_count) > max(db_chunk_count, qdrant_count) * 0.05:
+                            logger.warning(
+                                f"⚠️ 项目 {project_name} 向量数量不一致: "
+                                f"数据库 {db_chunk_count} vs Qdrant {qdrant_count}"
+                            )
                         
                 except Exception as e:
                     logger.warning(f"检查项目 {project_name} Qdrant 状态失败: {e}")
-                finally:
-                    if db:
-                        db.close()
                     
         except Exception as e:
             logger.error(f"Qdrant 健康检查失败: {e}")

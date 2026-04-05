@@ -447,27 +447,3 @@ def reset_failed_chunks(
         logger.error(f"重置失败 chunks 失败: {e}")
         return 0
     
-    def __del__(self):
-        """析构时关闭连接"""
-        # 注意：在异步环境中，__del__ 可能不会被正确调用
-        # 建议显式调用 close() 或使用上下文管理器
-        if self._sync_client:
-            try:
-                self._sync_client.close()
-            except:
-                pass
-        # AsyncClient 在析构时会自动关闭，但最好显式调用 close()
-        if self._async_client:
-            try:
-                # 尝试同步关闭（httpx 内部会处理）
-                import asyncio
-                try:
-                    loop = asyncio.get_running_loop()
-                    loop.call_soon_threadsafe(
-                        lambda: asyncio.ensure_future(self._async_client.aclose())
-                    )
-                except RuntimeError:
-                    # 无运行中的循环，直接创建新循环关闭
-                    asyncio.run(self._async_client.aclose())
-            except:
-                pass

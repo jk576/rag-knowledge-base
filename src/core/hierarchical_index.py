@@ -277,7 +277,8 @@ class HierarchicalIndex:
         document_id: str,
         chunks: List[str],
         filename: str,
-        metadata: Optional[Dict] = None
+        metadata: Optional[Dict] = None,
+        chunk_ids: Optional[List[str]] = None
     ) -> Optional[str]:
         """索引文档（生成并存储摘要）
         
@@ -287,6 +288,7 @@ class HierarchicalIndex:
             chunks: 文档分块列表
             filename: 文件名
             metadata: 额外元数据
+            chunk_ids: 关联的 chunk ID 列表（可选）
             
         Returns:
             摘要向量 ID，失败返回 None
@@ -314,6 +316,7 @@ class HierarchicalIndex:
             "filename": filename,
             "summary": summary,
             "chunk_count": len(chunks),
+            "chunk_ids": chunk_ids or [],  # 关联的 chunk IDs
             **(metadata or {})
         }
         
@@ -347,7 +350,8 @@ class HierarchicalIndex:
         document_id: str,
         chunks: List[str],
         filename: str,
-        metadata: Optional[Dict] = None
+        metadata: Optional[Dict] = None,
+        chunk_ids: Optional[List[str]] = None
     ) -> Optional[str]:
         """同步版本的文档索引"""
         if not chunks:
@@ -367,6 +371,7 @@ class HierarchicalIndex:
             "filename": filename,
             "summary": summary,
             "chunk_count": len(chunks),
+            "chunk_ids": chunk_ids or [],  # 关联的 chunk IDs
             **(metadata or {})
         }
         
@@ -395,16 +400,28 @@ class HierarchicalIndex:
             return None
     
     def delete_document_summary(self, project_id: str, document_id: str) -> bool:
-        """删除文档摘要"""
+        """删除文档摘要
+        
+        使用 payload filter 按 document_id 删除，而非按向量 ID 删除。
+        这是因为存储摘要时使用的是随机 UUID，不是 summary_{document_id} 格式。
+        """
         collection_name = self._get_summary_collection_name(project_id)
         
         try:
+            from qdrant_client import models as qdrant_models
+            
             self.vector_store.client.delete(
                 collection_name=collection_name,
-                points_selector=models.PointIdsList(
-                    points=[f"summary_{document_id}"]
-                ),
+                points_selector=qdrant_models.FilterSelector(
+                    filter=qdrant_models.Filter(
+                        must=[qdrant_models.FieldCondition(
+                            key="document_id",
+                            match=qdrant_models.MatchValue(value=document_id)
+                        )]
+                    )
+                )
             )
+            logger.info(f"文档摘要已删除: {document_id}")
             return True
         except Exception as e:
             logger.error(f"删除文档摘要失败: {e}")
